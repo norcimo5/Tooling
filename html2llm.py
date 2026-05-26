@@ -23,7 +23,6 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 import html2text
@@ -38,6 +37,24 @@ HARD_NOISE = (
 # Structural chrome — stripped only when it sits OUTSIDE an <article>, so that
 # per-article <header>s (which hold story titles on listing pages) survive.
 STRUCTURAL_NOISE = ("nav", "header", "footer", "aside")
+
+# Query-string keys that are pure tracking — drop them from URLs (anything
+# starting with "utm_" is also dropped).
+TRACKING_PARAMS = {
+    "gclid", "fbclid", "msclkid", "yclid", "mc_cid", "mc_eid", "igshid",
+    "ref", "ref_src", "_hsenc", "_hsmi", "spm", "scm", "vero_id",
+}
+
+
+def strip_tracking(url: str) -> str:
+    """Remove tracking parameters from a URL's query string."""
+    if "?" not in url:
+        return url
+    base, _, query = url.partition("?")
+    kept = [p for p in query.split("&")
+            if not (p.split("=", 1)[0].startswith("utm_")
+                    or p.split("=", 1)[0] in TRACKING_PARAMS)]
+    return base + ("?" + "&".join(kept) if kept else "")
 
 # Substrings in id/class that usually mark chrome, ads, or navigation.
 NOISE_PATTERNS = re.compile(
@@ -83,6 +100,14 @@ def strip_noise(soup: BeautifulSoup) -> None:
         if tag.decomposed:
             continue
         attrs = tag.attrs or {}
+        # Drop base64 data-URI images (token bombs) and 1px tracking pixels.
+        if tag.name == "img":
+            src = attrs.get("src", "")
+            if (src.startswith("data:")
+                    or attrs.get("width") in ("0", "1")
+                    or attrs.get("height") in ("0", "1")):
+                tag.decompose()
+                continue
         # Drop explicitly hidden elements.
         if "hidden" in attrs or attrs.get("aria-hidden") == "true":
             tag.decompose()
@@ -96,6 +121,14 @@ def strip_noise(soup: BeautifulSoup) -> None:
         ident = " ".join(filter(None, [attrs.get("id", ""), *classes]))
         if ident and NOISE_PATTERNS.search(ident):
             tag.decompose()
+            continue
+        # Strip title attrs — html2text echoes them after links/images as a
+        # near-duplicate of the URL, wasting tokens.
+        attrs.pop("title", None)
+        # Drop tracking junk from link/image targets.
+        for key in ("href", "src"):
+            if key in attrs:
+                attrs[key] = strip_tracking(attrs[key])
 
 
 def extract_main(soup: BeautifulSoup):
@@ -126,11 +159,35 @@ def to_markdown(node, base_url: str | None, ignore_links: bool,
     conv.body_width = 0            # no hard wrapping — keep one line per block
     conv.unicode_snob = True       # keep real unicode, not escapes
     conv.skip_internal_links = True
-    conv.protect_links = True
+    conv.protect_links = False     # no <url> angle brackets (saves 2 chars/link)
+    conv.mark_code = True          # tag <pre> blocks so we can fence them
     conv.ignore_links = ignore_links
     conv.ignore_images = ignore_images
-    md = conv.handle(str(node))
-    # Collapse runs of 3+ blank lines into a single blank line.
+    return normalize(conv.handle(str(node)))
+
+
+def _fence_code(match: re.Match) -> str:
+    """Turn an html2text [code]...[/code] block into a fenced code block."""
+    inner = match.group(1)
+    # html2text indents the block by 4 spaces; strip that base indent.
+    lines = [ln[4:] if ln.startswith("    ") else ln for ln in inner.split("\n")]
+    while lines and not lines[0].strip():    # drop blank edge lines
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def normalize(md: str) -> str:
+    """Tighten Markdown so it carries the same information in fewer tokens."""
+    md = re.sub(r"\[code\]\n?(.*?)\n?\[/code\]", _fence_code, md, flags=re.DOTALL)
+    # Strip trailing whitespace, including Markdown hard-break markers.
+    md = re.sub(r"[ \t]+$", "", md, flags=re.MULTILINE)
+    # Exactly one space after a heading's #'s.
+    md = re.sub(r"(?m)^(#{1,6})[ \t]+", r"\1 ", md)
+    # Drop empty links/images (anchor text or alt was empty — just a bare URL).
+    md = re.sub(r"!?\[\]\([^)]*\)", "", md)
+    # Collapse runs of 3+ newlines into a single blank line.
     md = re.sub(r"\n{3,}", "\n\n", md)
     return md.strip() + "\n"
 
@@ -160,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-images", action="store_true", help="strip images")
     parser.add_argument("--no-header", action="store_true",
                         help="omit the title/source metadata header")
+    parser.add_argument("--stats", action="store_true",
+                        help="print size/token reduction to stderr")
     args = parser.parse_args(argv)
 
     html, base_url = read_input(args.input)
@@ -179,7 +238,20 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
     else:
         sys.stdout.write(result)
+
+    if args.stats:
+        report_stats(len(html), len(result))
     return 0
+
+
+def report_stats(in_chars: int, out_chars: int) -> None:
+    """Print a rough size/token reduction summary to stderr (~4 chars/token)."""
+    cut = (in_chars - out_chars) / in_chars * 100 if in_chars else 0
+    print(
+        f"html2llm: {in_chars:,} -> {out_chars:,} chars  "
+        f"(~{in_chars // 4:,} -> ~{out_chars // 4:,} tokens, {cut:.0f}% smaller)",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

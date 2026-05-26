@@ -26,9 +26,28 @@ Input can be a local `.html` file, an `http(s)` URL, or `-` for stdin.
 | -------------- | --------------------------------------------------- |
 | `-o, --output` | Write Markdown to a file (default: stdout)          |
 | `--main`       | Keep only the main content, dropping boilerplate    |
-| `--no-links`   | Strip hyperlinks                                    |
+| `--no-links`   | Strip hyperlinks (keeps the anchor text)            |
 | `--no-images`  | Strip images                                        |
 | `--no-header`  | Omit the title/source metadata header               |
+| `--stats`      | Print size/token reduction to stderr                |
+
+### Token efficiency
+
+The point of this tool is to spend fewer tokens on a page while keeping its
+information. It strips markup, scripts, chrome, and duplicated link metadata;
+drops base64 `data:` images (token bombs) and tracking query params; fences code
+blocks; and trims redundant whitespace. On a saved Slashdot homepage:
+
+| Mode                       | Size       | Approx. tokens | Smaller than raw HTML |
+| -------------------------- | ---------- | -------------- | --------------------- |
+| raw HTML                   | 148 KB     | ~37,000        | —                     |
+| default                    | 42 KB      | ~10,500        | 72%                   |
+| `--no-links`               | 32 KB      | ~7,900         | 79%                   |
+| `--no-links --no-images`   | 30 KB      | ~7,500         | 80%                   |
+
+For maximum savings when the URLs don't matter, use `--no-links` — anchor text
+(and source domains in headings) is preserved, only the URLs are dropped. Pass
+`--stats` to see the reduction for your own page.
 
 ### Requirements
 
