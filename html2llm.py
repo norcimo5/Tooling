@@ -30,11 +30,14 @@ import html2text
 from bs4 import BeautifulSoup, Comment
 
 # Tags that never carry readable content worth keeping.
-NOISE_TAGS = (
+HARD_NOISE = (
     "script", "style", "noscript", "template", "svg", "canvas",
-    "iframe", "form", "button", "input", "select", "textarea",
-    "nav", "footer", "header", "aside", "dialog",
+    "iframe", "form", "button", "input", "select", "textarea", "dialog",
 )
+
+# Structural chrome — stripped only when it sits OUTSIDE an <article>, so that
+# per-article <header>s (which hold story titles on listing pages) survive.
+STRUCTURAL_NOISE = ("nav", "header", "footer", "aside")
 
 # Substrings in id/class that usually mark chrome, ads, or navigation.
 NOISE_PATTERNS = re.compile(
@@ -66,30 +69,47 @@ def strip_noise(soup: BeautifulSoup) -> None:
     for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
         comment.extract()
 
-    for tag in soup(list(NOISE_TAGS)):
+    for tag in soup(list(HARD_NOISE)):
         tag.decompose()
 
+    # Drop site chrome but keep structural tags that live inside an article.
+    for tag in soup(list(STRUCTURAL_NOISE)):
+        if not tag.decomposed and not tag.find_parent("article"):
+            tag.decompose()
+
     for tag in soup.find_all(True):
+        # Decomposing a parent nulls out its descendants' attrs, so skip any
+        # node already destroyed earlier in this loop.
+        if tag.decomposed:
+            continue
+        attrs = tag.attrs or {}
         # Drop explicitly hidden elements.
-        if tag.has_attr("hidden") or tag.get("aria-hidden") == "true":
+        if "hidden" in attrs or attrs.get("aria-hidden") == "true":
             tag.decompose()
             continue
-        style = (tag.get("style") or "").replace(" ", "").lower()
+        style = (attrs.get("style") or "").replace(" ", "").lower()
         if "display:none" in style or "visibility:hidden" in style:
             tag.decompose()
             continue
         # Drop chrome/ads matched by id or class name.
-        ident = " ".join(filter(None, [tag.get("id", ""), *tag.get("class", [])]))
+        classes = attrs.get("class") or []
+        ident = " ".join(filter(None, [attrs.get("id", ""), *classes]))
         if ident and NOISE_PATTERNS.search(ident):
             tag.decompose()
 
 
 def extract_main(soup: BeautifulSoup):
     """Pick the node most likely to hold the article body."""
-    for selector in ("main", "article", "[role=main]"):
+    for selector in ("main", "[role=main]"):
         node = soup.select_one(selector)
         if node and node.get_text(strip=True):
             return node
+
+    # A single <article> is the page body; several <article>s means a listing
+    # page (e.g. a news homepage), so don't collapse it to just the first one.
+    articles = [a for a in soup.find_all("article") if a.get_text(strip=True)]
+    if len(articles) == 1:
+        return articles[0]
 
     # Fallback: among block containers, choose the one with the most text.
     best, best_len = None, 0
